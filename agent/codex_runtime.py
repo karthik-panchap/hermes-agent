@@ -1036,6 +1036,46 @@ def _raise_stream_error(event: Any) -> None:
     )
 
 
+def _resolve_settled_pending_key(
+    done_item,
+    done_id: str,
+    done_index,
+    pending_function_calls,
+) -> str:
+    """Return the ``pending_function_calls`` key this ``.done`` item confirms.
+
+    Resolution order, most to least authoritative:
+
+    1. ``id`` — the key the item was announced under. Always preferred.
+    2. ``call_id`` — the protocol's tool-result correlation handle. Minted per
+       ``function_call`` item, so it cannot legitimately name a different call:
+       two items sharing one would already collide downstream on
+       ``tool_call_id``.
+    3. ``output_index`` — the item's positional identity within the response,
+       used only when the ``.done`` event carries one.
+
+    Falls back to ``done_id`` (usually ``""``) when nothing matches, which
+    leaves the previous behavior intact for genuinely unannounced items.
+    """
+    if done_id and done_id in pending_function_calls:
+        return done_id
+
+    done_call_id = _item_field(done_item, "call_id", None)
+    if isinstance(done_call_id, str) and done_call_id.strip():
+        target = done_call_id.strip()
+        for key, pending in pending_function_calls.items():
+            candidate = _item_field(pending.get("item"), "call_id", None)
+            if isinstance(candidate, str) and candidate.strip() == target:
+                return key
+
+    if done_index is not None:
+        for key, pending in pending_function_calls.items():
+            if pending.get("output_index") == done_index:
+                return key
+
+    return done_id
+
+
 def _consume_codex_event_stream(
     event_iter: Any,
     *,
@@ -1278,10 +1318,35 @@ def _consume_codex_event_stream(
                 # The .done event's own output_index wins when present, with
                 # the announced index as its fallback.
                 done_id = str(_item_field(done_item, "id", ""))
-                announced_sequence, announced_index = announced_output_order.get(
-                    done_id, (None, None)
-                )
+                # Which announced item is this ``.done`` frame confirming?
+                #
+                # ``id`` is the primary key and stays authoritative, but a
+                # backend may omit it on the ``.done`` frame while still
+                # announcing the item normally (observed on Copilot-routed
+                # gpt-5.6-sol, 2026-08-24). When that happened the pending
+                # entry was never cleared and the settle block below re-emitted
+                # the same call a second time — a phantom twin that survives
+                # ``_deduplicate_tool_calls``, executes, fails, and trips the
+                # tool-loop guardrail.
+                #
+                # ``call_id`` (the protocol's tool-result correlation handle)
+                # and then the item's ``output_index`` (its positional
+                # identity) recover the announced item when ``id`` is missing.
+                # ONE resolved key serves both the position lookup and the pop:
+                # resolving them separately settles the call at a fresh tail
+                # sequence and reorders it against still-pending siblings,
+                # which is the hazard ``announced_output_order`` exists to
+                # prevent.
                 done_index = _event_field(event, "output_index", None)
+                settle_key = _resolve_settled_pending_key(
+                    done_item,
+                    done_id,
+                    done_index,
+                    pending_function_calls,
+                )
+                announced_sequence, announced_index = announced_output_order.get(
+                    settle_key, (None, None)
+                )
                 if done_index is None:
                     done_index = announced_index
                 if announced_sequence is None:
@@ -1291,7 +1356,7 @@ def _consume_codex_event_stream(
                 collected_output_sequences.append(announced_sequence)
                 # Confirmed by the authoritative per-item done event; remove
                 # from pending so it is not settled twice.
-                pending_function_calls.pop(done_id, None)
+                pending_function_calls.pop(settle_key, None)
                 done_phase = _item_field(done_item, "phase", None)
                 done_phase = done_phase.strip().lower() if isinstance(done_phase, str) else None
                 if done_phase == "commentary" and on_commentary_message is not None:
