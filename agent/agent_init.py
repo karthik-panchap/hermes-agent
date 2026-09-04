@@ -606,6 +606,10 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # Runs API steering requires a guaranteed in-turn delivery point. This
+    # window is open only while a tool batch is executing and closes atomically
+    # with the batch's final steer drain.
+    agent._steer_delivery_open = False
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker

@@ -1029,11 +1029,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             stage=f"tool result {name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Same as the sequential path: drain between each collected
-        # result so the steer lands as early as possible.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
-
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
@@ -1045,7 +1040,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # agent sees it on its next iteration. Runs AFTER budget enforcement
     # so the steer marker is never truncated. See steer() for details.
     if finalize and num_tools > 0:
-        agent._apply_pending_steer_to_tool_results(messages, num_tools)
+        agent._apply_pending_steer_to_tool_results(
+            messages,
+            num_tools,
+            close_delivery=True,
+        )
 
 
 
@@ -1099,7 +1098,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 messages,
                 stage=f"invalid tool arguments {function_name}",
             )
-            agent._apply_pending_steer_to_tool_results(messages, 1)
             continue
 
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
@@ -1713,12 +1711,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             stage=f"tool result {function_name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Drain pending steer BETWEEN individual tool calls so the
-        # injection lands as soon as a tool finishes — not after the
-        # entire batch.  The model sees it on the next API iteration.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
-
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -1758,7 +1750,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # See _execute_tool_calls_parallel for the rationale. Same hook,
     # applied to sequential execution as well.
     if finalize and num_tools_seq > 0:
-        agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+        agent._apply_pending_steer_to_tool_results(
+            messages,
+            num_tools_seq,
+            close_delivery=True,
+        )
 
 
 
@@ -1815,7 +1811,11 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         )
-        agent._apply_pending_steer_to_tool_results(messages, total_tools)
+        agent._apply_pending_steer_to_tool_results(
+            messages,
+            total_tools,
+            close_delivery=True,
+        )
 
 
 __all__ = [

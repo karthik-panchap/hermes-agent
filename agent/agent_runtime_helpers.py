@@ -3327,7 +3327,13 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
 
 
 
-def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
+def apply_pending_steer_to_tool_results(
+    agent,
+    messages: list,
+    num_tool_msgs: int,
+    *,
+    close_delivery: bool = False,
+) -> None:
     """Append any pending /steer text to the last tool result in this turn.
 
     Called at the end of a tool-call batch, before the next API call.
@@ -3342,8 +3348,10 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             used to locate the tail slice safely.
     """
     if num_tool_msgs <= 0 or not messages:
+        if close_delivery:
+            agent._set_steer_delivery_open(False)
         return
-    steer_text = agent._drain_pending_steer()
+    steer_text = agent._drain_pending_steer(close_delivery=close_delivery)
     if not steer_text:
         return
     # Find the last tool-role message in the recent tail. Skipping

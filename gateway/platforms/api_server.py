@@ -17,7 +17,8 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
-- POST /v1/runs/{run_id}/approval — resolve a pending run approval
+- POST /v1/runs/{run_id}/approval  — resolve a pending run approval
+- POST /v1/runs/{run_id}/steer     — guide the named active run
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
@@ -987,10 +988,19 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Request-profile ownership for each pollable run. Keep this until the
+        # terminal status expires so control retries cannot cross profiles.
+        self._run_profiles: Dict[str, Optional[str]] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Accepted steer requests stay replayable for the same lifetime as
+        # pollable run status. Entries are never evicted while their run status
+        # exists, because replaying an evicted key could apply guidance twice.
+        self._run_steer_idempotency: Dict[
+            tuple[Optional[str], str], Dict[str, Any]
+        ] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
         # Concurrency cap shared across all agent-serving endpoints
@@ -1523,6 +1533,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+            ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -2041,6 +2052,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_steer": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -2068,6 +2080,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -4868,11 +4881,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
+        # Background work outlives the HTTP middleware's profile scope.
+        request_profile = _api_request_profile.get()
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
+        self._run_profiles[run_id] = request_profile
         self._run_approval_sessions[run_id] = approval_session_key
 
         event_cb = self._make_run_event_callback(run_id, loop)
@@ -4908,9 +4924,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Per-client model routing for /v1/runs (see model_routes).
         route = self._resolve_route(body.get("model"))
-        # Background task outlives the HTTP response (and thus the middleware
-        # profile scope). Capture now and re-enter inside the task/executor.
-        request_profile = _api_request_profile.get()
 
         async def _run_and_close():
             try:
@@ -5288,6 +5301,175 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — guide the named live agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error(
+                    "Request body must be a JSON object",
+                    code="invalid_steer_request",
+                ),
+                status=400,
+            )
+
+        raw_message = body.get("message")
+        if not isinstance(raw_message, str) or not raw_message.strip():
+            return web.json_response(
+                _openai_error(
+                    "'message' must be a non-empty string",
+                    param="message",
+                    code="invalid_steer_message",
+                ),
+                status=400,
+            )
+        message = raw_message.strip()
+        run_id = request.match_info["run_id"]
+        request_profile = _api_request_profile.get()
+
+        status = self._run_statuses.get(run_id)
+        if status is None or self._run_profiles.get(run_id) != request_profile:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key is not None:
+            idempotency_key = idempotency_key.strip()
+            if not idempotency_key or len(idempotency_key) > 255:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key must contain 1 to 255 characters",
+                        code="invalid_idempotency_key",
+                    ),
+                    status=400,
+                )
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {"run_id": run_id, "message": message},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            cache_key = (request_profile, idempotency_key)
+            prior = self._run_steer_idempotency.get(cache_key)
+            if prior is not None:
+                if prior["fingerprint"] != fingerprint:
+                    return web.json_response(
+                        _openai_error(
+                            "Idempotency-Key was already used for a different steer request",
+                            code="idempotency_key_conflict",
+                        ),
+                        status=409,
+                    )
+                return web.json_response(prior["response"], status=prior["status"])
+        else:
+            fingerprint = None
+            cache_key = None
+
+        approval_session_key = self._run_approval_sessions.get(run_id)
+        approval_pending = status.get("status") == "waiting_for_approval"
+        if approval_session_key:
+            try:
+                from tools.approval import has_blocking_approval
+
+                approval_pending = approval_pending or has_blocking_approval(
+                    approval_session_key
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] failed to inspect approval state for run %s",
+                    run_id,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Unable to verify run approval state",
+                        err_type="server_error",
+                        code="steer_state_check_failed",
+                    ),
+                    status=500,
+                )
+        if approval_pending:
+            return web.json_response(
+                _openai_error(
+                    f"Run is waiting for approval: {run_id}",
+                    code="run_waiting_for_approval",
+                ),
+                status=409,
+            )
+
+        task = self._active_run_tasks.get(run_id)
+        agent = self._active_run_agents.get(run_id)
+        if (
+            status.get("status") != "running"
+            or run_id in self._stopping_run_ids
+            or task is None
+            or task.done()
+            or agent is None
+        ):
+            return web.json_response(
+                _openai_error(
+                    f"Run is not active: {run_id}",
+                    code="run_not_active",
+                ),
+                status=409,
+            )
+
+        steer = getattr(agent, "steer", None)
+        if not callable(steer):
+            return web.json_response(
+                _openai_error(
+                    f"Run does not accept steering: {run_id}",
+                    code="steer_rejected",
+                ),
+                status=409,
+            )
+
+        try:
+            accepted = bool(steer(message, require_delivery=True))
+        except Exception as exc:
+            logger.exception("[api_server] steer failed for run %s", run_id)
+            response_data = _openai_error(
+                _redact_api_error_text(exc),
+                err_type="server_error",
+                code="steer_failed",
+            )
+            response_status = 500
+        else:
+            if not accepted:
+                response_data = _openai_error(
+                    f"Run rejected steering: {run_id}",
+                    code="steer_rejected",
+                )
+                response_status = 409
+            else:
+                response_data = {
+                    "object": "hermes.run.steer_response",
+                    "run_id": run_id,
+                    "status": "accepted",
+                }
+                response_status = 200
+
+        if cache_key is not None and response_status == 200:
+            # There are no awaits between the first cache lookup, the sync
+            # agent.steer() call, and this write. aiohttp handlers on this event
+            # loop therefore serialize duplicate keys around the side effect.
+            self._run_steer_idempotency[cache_key] = {
+                "fingerprint": fingerprint,
+                "run_id": run_id,
+                "response": response_data,
+                "status": response_status,
+            }
+        return web.json_response(response_data, status=response_status)
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -5359,6 +5541,12 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_profiles.pop(run_id, None)
+        if stale_statuses:
+            stale_run_ids = set(stale_statuses)
+            for key, entry in list(self._run_steer_idempotency.items()):
+                if entry.get("run_id") in stale_run_ids:
+                    self._run_steer_idempotency.pop(key, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

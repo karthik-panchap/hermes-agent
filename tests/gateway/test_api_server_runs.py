@@ -1,9 +1,10 @@
-"""Tests for /v1/runs endpoints: start, status, events, and stop.
+"""Tests for /v1/runs endpoints: start, status, events, steer, and stop.
 
 Covers:
 - POST /v1/runs — start a run (202)
 - GET /v1/runs/{run_id} — poll run status
 - GET /v1/runs/{run_id}/events — SSE event stream
+- POST /v1/runs/{run_id}/steer — guide a live run
 - POST /v1/runs/{run_id}/stop — interrupt a running agent
 - Auth, error handling, and cleanup
 """
@@ -69,6 +70,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -595,6 +597,278 @@ class TestRunLifecycleSweep:
         assert pending.event.is_set()
         with approval_mod._lock:
             assert run_id not in approval_mod._gateway_queues
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs/{run_id}/steer — guide a running agent
+# ---------------------------------------------------------------------------
+
+
+class TestSteerRun:
+    @staticmethod
+    def _install_active_run(adapter, run_id, agent):
+        task = MagicMock()
+        task.done.return_value = False
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        adapter._run_profiles[run_id] = None
+        adapter._active_run_tasks[run_id] = task
+        adapter._active_run_agents[run_id] = agent
+        adapter._run_approval_sessions[run_id] = run_id
+
+    @pytest.mark.asyncio
+    async def test_steer_accepts_started_live_run(self, adapter):
+        app = _create_runs_app(adapter)
+        agent, ready, interrupted = _make_slow_agent()
+        agent.steer = MagicMock(return_value=True)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                start = await cli.post("/v1/runs", json={"input": "investigate"})
+                run_id = (await start.json())["run_id"]
+                assert ready.wait(timeout=3.0)
+
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/steer",
+                    json={"message": "prioritize the failing request"},
+                    headers={"Idempotency-Key": "steer-live-1"},
+                )
+                data = await response.json()
+                interrupted.set()
+
+        assert response.status == 200
+        assert data == {
+            "object": "hermes.run.steer_response",
+            "run_id": run_id,
+            "status": "accepted",
+        }
+        agent.steer.assert_called_once_with(
+            "prioritize the failing request",
+            require_delivery=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_steer_targets_named_live_agent_and_replays_retry(self, adapter):
+        app = _create_runs_app(adapter)
+        target = MagicMock()
+        target.steer.return_value = True
+        other = MagicMock()
+        other.steer.return_value = True
+        self._install_active_run(adapter, "run_target", target)
+        self._install_active_run(adapter, "run_other", other)
+        headers = {"Idempotency-Key": "steer-retry-1"}
+
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                "/v1/runs/run_target/steer",
+                json={"message": "focus on the active failure"},
+                headers=headers,
+            )
+            first_data = await first.json()
+            adapter._run_statuses["run_target"]["status"] = "completed"
+            adapter._active_run_tasks.pop("run_target")
+            adapter._active_run_agents.pop("run_target")
+            retry = await cli.post(
+                "/v1/runs/run_target/steer",
+                json={"message": "focus on the active failure"},
+                headers=headers,
+            )
+            retry_data = await retry.json()
+
+        assert first.status == 200
+        assert retry.status == 200
+        assert first_data == retry_data == {
+            "object": "hermes.run.steer_response",
+            "run_id": "run_target",
+            "status": "accepted",
+        }
+        target.steer.assert_called_once_with(
+            "focus on the active failure",
+            require_delivery=True,
+        )
+        other.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_steer_concurrent_duplicate_applies_once(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        self._install_active_run(adapter, "run_concurrent", agent)
+        headers = {"Idempotency-Key": "steer-concurrent-1"}
+
+        async with TestClient(TestServer(app)) as cli:
+            responses = await asyncio.gather(
+                cli.post(
+                    "/v1/runs/run_concurrent/steer",
+                    json={"message": "use the cached plan"},
+                    headers=headers,
+                ),
+                cli.post(
+                    "/v1/runs/run_concurrent/steer",
+                    json={"message": "use the cached plan"},
+                    headers=headers,
+                ),
+            )
+            payloads = [await response.json() for response in responses]
+
+        assert [response.status for response in responses] == [200, 200]
+        assert payloads[0] == payloads[1]
+        agent.steer.assert_called_once_with(
+            "use the cached plan",
+            require_delivery=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_steer_same_key_different_payload_conflicts(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        self._install_active_run(adapter, "run_conflict", agent)
+        headers = {"Idempotency-Key": "steer-conflict-1"}
+
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                "/v1/runs/run_conflict/steer",
+                json={"message": "first"},
+                headers=headers,
+            )
+            conflict = await cli.post(
+                "/v1/runs/run_conflict/steer",
+                json={"message": "different"},
+                headers=headers,
+            )
+            conflict_data = await conflict.json()
+
+        assert first.status == 200
+        assert conflict.status == 409
+        assert conflict_data["error"]["code"] == "idempotency_key_conflict"
+        agent.steer.assert_called_once_with("first", require_delivery=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("run_id", "status", "expected_status", "expected_code"),
+        [
+            ("run_missing", None, 404, "run_not_found"),
+            ("run_completed", "completed", 409, "run_not_active"),
+            ("run_failed", "failed", 409, "run_not_active"),
+            ("run_cancelled", "cancelled", 409, "run_not_active"),
+            ("run_queued", "queued", 409, "run_not_active"),
+        ],
+    )
+    async def test_steer_rejects_unknown_or_inactive_run(
+        self, adapter, run_id, status, expected_status, expected_code
+    ):
+        app = _create_runs_app(adapter)
+        if status is not None:
+            adapter._run_statuses[run_id] = {"run_id": run_id, "status": status}
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/runs/{run_id}/steer",
+                json={"message": "do not queue this"},
+            )
+            data = await response.json()
+
+        assert response.status == expected_status
+        assert data["error"]["code"] == expected_code
+
+    @pytest.mark.asyncio
+    async def test_steer_rejects_run_waiting_for_approval(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        self._install_active_run(adapter, "run_approval", agent)
+        adapter._run_statuses["run_approval"]["status"] = "waiting_for_approval"
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_approval/steer",
+                json={"message": "skip the approval"},
+            )
+            data = await response.json()
+
+        assert response.status == 409
+        assert data["error"]["code"] == "run_waiting_for_approval"
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_steer_hides_run_owned_by_another_profile(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        self._install_active_run(adapter, "run_other_profile", agent)
+        adapter._run_profiles["run_other_profile"] = "coder"
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_other_profile/steer",
+                json={"message": "cross the profile boundary"},
+            )
+            data = await response.json()
+
+        assert response.status == 404
+        assert data["error"]["code"] == "run_not_found"
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("side_effect", "return_value", "expected_status", "expected_code"),
+        [
+            (None, False, 409, "steer_rejected"),
+            (RuntimeError("steer exploded"), None, 500, "steer_failed"),
+        ],
+    )
+    async def test_steer_surfaces_agent_rejection_or_failure(
+        self, adapter, side_effect, return_value, expected_status, expected_code
+    ):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.side_effect = side_effect
+        agent.steer.return_value = return_value
+        self._install_active_run(adapter, "run_rejected", agent)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_rejected/steer",
+                json={"message": "try this"},
+                headers={"Idempotency-Key": "steer-failure-1"},
+            )
+            agent.steer.side_effect = None
+            agent.steer.return_value = True
+            retry = await cli.post(
+                "/v1/runs/run_rejected/steer",
+                json={"message": "try this"},
+                headers={"Idempotency-Key": "steer-failure-1"},
+            )
+            data = await response.json()
+
+        assert response.status == expected_status
+        assert retry.status == 200
+        assert data["error"]["code"] == expected_code
+        assert agent.steer.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_steer_validates_payload_and_authentication(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            unauthenticated = await cli.post(
+                "/v1/runs/run_any/steer",
+                json={"message": "hello"},
+            )
+            invalid_responses = [
+                await cli.post(
+                    "/v1/runs/run_any/steer",
+                    json=body,
+                    headers={"Authorization": f"Bearer {auth_adapter._api_key}"},
+                )
+                for body in ({"message": "  "}, {}, {"message": 42})
+            ]
+            invalid_data = [await response.json() for response in invalid_responses]
+
+        assert unauthenticated.status == 401
+        assert [response.status for response in invalid_responses] == [400, 400, 400]
+        assert {
+            data["error"]["code"] for data in invalid_data
+        } == {"invalid_steer_message"}
 
 
 # ---------------------------------------------------------------------------

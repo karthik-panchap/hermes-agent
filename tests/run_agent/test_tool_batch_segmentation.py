@@ -378,9 +378,7 @@ class TestSegmentedDispatchIntegration:
             assert "cancelled" in m["content"] or "skipped" in m["content"]
 
     def test_steer_lands_exactly_once_in_mixed_batch(self, agent):
-        """Steer is drained once (per-tool drains + one dispatcher-level
-        finalize) — the marker must appear exactly once across the batch,
-        never duplicated by segment boundaries."""
+        """The dispatcher-level drain applies one steer across all segments."""
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),
             _tc("web_search", '{"query":"b"}', call_id="s2"),
@@ -398,6 +396,33 @@ class TestSegmentedDispatchIntegration:
 
         contents = [m["content"] for m in messages]
         hits = [c for c in contents if "focus on the tests" in c]
+        assert len(hits) == 1
+
+    def test_steer_survives_aggregate_tool_result_budgeting(self, agent):
+        calls = [
+            _tc("web_search", '{"query":"a"}', call_id="s1"),
+            _tc("web_search", '{"query":"b"}', call_id="s2"),
+            _tc("terminal", '{"command":"large"}', call_id="t1"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            if kwargs["tool_call_id"] == "t1":
+                assert agent.steer(
+                    "preserve this guidance",
+                    require_delivery=True,
+                )
+            return "x" * 90_000
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        hits = [
+            result["content"]
+            for result in messages
+            if "preserve this guidance" in result["content"]
+        ]
         assert len(hits) == 1
 
 

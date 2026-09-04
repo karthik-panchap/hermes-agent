@@ -2896,7 +2896,16 @@ class AIAgent:
             with _steer_lock:
                 self._pending_steer = None
 
-    def steer(self, text: str) -> bool:
+    def _set_steer_delivery_open(self, is_open: bool) -> None:
+        """Set whether a steer can still reach this turn's tool results."""
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            self._steer_delivery_open = is_open
+            return
+        with lock:
+            self._steer_delivery_open = is_open
+
+    def steer(self, text: str, *, require_delivery: bool = False) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -2910,6 +2919,8 @@ class AIAgent:
 
         Args:
             text: The user text to inject. Empty strings are ignored.
+            require_delivery: Reject unless a tool batch currently has a
+                guaranteed drain point in this run.
 
         Returns:
             True if the steer was accepted, False if the text was empty.
@@ -2922,28 +2933,38 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if require_delivery and not getattr(self, "_steer_delivery_open", False):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            if require_delivery and not getattr(self, "_steer_delivery_open", False):
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
 
-    def _drain_pending_steer(self) -> Optional[str]:
+    def _drain_pending_steer(self, *, close_delivery: bool = False) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 
         Safe to call from the agent execution thread after appending tool
-        results. Returns None when no steer is pending.
+        results. Returns None when no steer is pending. ``close_delivery``
+        atomically rejects new delivery-guaranteed steers before the final
+        drain of a tool batch.
         """
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
+            if close_delivery:
+                self._steer_delivery_open = False
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
             return text
         with _lock:
+            if close_delivery:
+                self._steer_delivery_open = False
             text = self._pending_steer
             self._pending_steer = None
         return text
@@ -3194,10 +3215,21 @@ class AIAgent:
         # which already surfaces its own message) — don't second-guess.
         return ""
 
-    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
+    def _apply_pending_steer_to_tool_results(
+        self,
+        messages: list,
+        num_tool_msgs: int,
+        *,
+        close_delivery: bool = False,
+    ) -> None:
         """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
-        return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
+        return apply_pending_steer_to_tool_results(
+            self,
+            messages,
+            num_tool_msgs,
+            close_delivery=close_delivery,
+        )
 
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe).
@@ -6184,6 +6216,7 @@ class AIAgent:
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
+        self._set_steer_delivery_open(True)
         try:
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
@@ -6211,6 +6244,7 @@ class AIAgent:
                 segments=segments,
             )
         finally:
+            self._set_steer_delivery_open(False)
             self._executing_tools = False
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
